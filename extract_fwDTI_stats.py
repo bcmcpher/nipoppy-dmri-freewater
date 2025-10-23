@@ -4,11 +4,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from matplotlib import pyplot as plt
 
 import nibabel as nib
 from nibabel.processing import conform
 
-from dipy.align import affine_registration
+from dipy.align import affine_registration, syn_registration, read_mapping, write_mapping
+from dipy.align.imaffine import AffineMap
 
 
 def loadLabels(invol, tlabels):
@@ -67,9 +69,156 @@ def nanAvg(inp):
     return(out)
 
 
+def qcOverlaySlices(ref, mov, labels=False, slice_index=None, plot_title=None, fname=None, **fig_kwargs):
+    """
+    Plot three overlaid slices from the given volumes.
+
+    Creates a figure containing three images: the gray scale k-th slice of
+    the first volume (ref) to the left, where k=slice_index, the k-th slice of
+    the second volume (mov) to the right and the k-th slices of the two given
+    images on top of each other using the red channel for the first volume and
+    the green channel for the second one. It is assumed that both volumes have
+    the same shape. The intended use of this function is to visually assess the
+    quality of a registration result.
+
+    Modified from dipy's regtools.overlay_slices. Thanks!
+
+    Parameters
+    ----------
+    ref : array or NIfTI, shape (S, R, C)
+        the reference image from registration plotted to the left.
+    mov : array or NIfTI, shape (S, R, C)
+        the moving image from the registration plotted to the right.
+    labels: bool, optional
+        if True, treat the moving image as labels and set the value of all
+        non-zero voxels to one for a mask of labeled brain.
+    slice_index : int, list, or tuple; optional
+        the index of the slices to be overlaid. A single value or list /
+        tuple of 3 values can be passed for sagittal, coronal, and axial
+        indices. If None, the slice along the specified axis is used.
+    plot_title : string, optional
+        the title of the plot. If None (default), a generic title is used.
+    fname : string, optional
+        the name of the file to write the image to. If None (default), the
+        figure is not saved to disk.
+    fig_kwargs: extra parameters for saving figure, e.g. `dpi=300`.
+    """
+
+    # if images are nifti objects, extract the data
+    if isinstance(ref, np.ndarray):
+        pass
+    elif isinstance(ref, nib.Nifti1Image):
+        ref = ref.get_fdata()
+    elif isinstance(ref, nib.Nifti2Image):
+        ref = ref.get_fdata()
+    else:
+        raise ValueError("ref must be a Nifti1Image, Nifti2Image, or numpy array.")
+
+    if isinstance(mov, np.ndarray):
+        pass
+    elif isinstance(mov, nib.Nifti1Image):
+        mov = mov.get_fdata()
+    elif isinstance(mov, nib.Nifti2Image):
+        mov = mov.get_fdata()
+    else:
+        raise ValueError("mov must be a Nifti1Image, Nifti2Image, or numpy array.")
+
+    # Normalize the intensities to [0,255]
+    sh = ref.shape
+    ref = np.asarray(ref, dtype=np.float64)
+    mov = np.asarray(mov, dtype=np.float64)
+    ref = 255 * (ref - ref.min()) / (ref.max() - ref.min())
+
+    # for labels, binarize the moving image
+    if labels:
+        mov = np.where(mov > 0, 255, 0)
+        rtitle="Label Mask"
+    else:
+        mov = 255 * (mov - mov.min()) / (mov.max() - mov.min())
+        rtitle="Subject"
+
+    # if slice_index is a single value, assign to all views, otherwise unpack
+    if slice_index is None:
+        idxs = sh[0] // 2
+        idxc = sh[1] // 2
+        idxa = sh[2] // 2
+    elif isinstance(slice_index, int):
+        idxs = idxc = idxa = slice_index
+    elif isinstance(slice_index, (list, tuple)) and len(slice_index) == 3:
+        idxs, idxc, idxa = slice_index
+    else:
+        raise ValueError("slice_index must be None, an int, or a list/tuple of 3 ints.")
+
+    # Create the color image to draw the overlapped slices into, and extract
+    # the slices (note the transpositions)
+
+    # sagittal
+    cs = np.zeros(shape=(sh[2], sh[1], 3), dtype=np.uint8)
+    ls = np.asarray(ref[idxs, :, :]).astype(np.uint8).T
+    rs = np.asarray(mov[idxs, :, :]).astype(np.uint8).T
+
+    # coronal
+    cc = np.zeros(shape=(sh[2], sh[0], 3), dtype=np.uint8)
+    lc = np.asarray(ref[:, idxc, :]).astype(np.uint8).T
+    rc = np.asarray(mov[:, idxc, :]).astype(np.uint8).T
+
+    # axial
+    ca = np.zeros(shape=(sh[1], sh[0], 3), dtype=np.uint8)
+    la = np.asarray(ref[:, :, idxa]).astype(np.uint8).T
+    ra = np.asarray(mov[:, :, idxa]).astype(np.uint8).T
+
+    # Draw the intensity images to the appropriate channels of the color image
+    # The "(ll > ll[0, 0])" condition is just an attempt to eliminate the
+    # background when its intensity is not exactly zero (the [0,0] corner is
+    # usually background)
+    cs[..., 0] = ls * (ls > ls[0, 0])
+    cc[..., 0] = lc * (lc > lc[0, 0])
+    ca[..., 0] = la * (la > la[0, 0])
+    cs[..., 1] = rs * (rs > rs[0, 0])
+    cc[..., 1] = rc * (rc > rc[0, 0])
+    ca[..., 1] = ra * (ra > ra[0, 0])
+
+    # create a big figure with 3x3 subplots
+    fig, ax = plt.subplots(3, 3)
+    ax[0, 0].set_axis_off()
+    ax[0, 0].imshow(ls, cmap=plt.cm.gray, origin="lower")
+    ax[0, 0].set_title("Reference")
+    ax[0, 1].set_axis_off()
+    ax[0, 1].imshow(cs, cmap=plt.cm.gray, origin="lower")
+    ax[0, 1].set_title("Overlay")
+    ax[0, 2].set_axis_off()
+    ax[0, 2].imshow(rs, cmap=plt.cm.gray, origin="lower")
+    ax[0, 2].set_title(rtitle)
+    ax[1, 0].set_axis_off()
+    ax[1, 0].imshow(lc, cmap=plt.cm.gray, origin="lower")
+    ax[1, 1].set_axis_off()
+    ax[1, 1].imshow(cc, cmap=plt.cm.gray, origin="lower")
+    ax[1, 2].set_axis_off()
+    ax[1, 2].imshow(rc, cmap=plt.cm.gray, origin="lower")
+    ax[2, 0].set_axis_off()
+    ax[2, 0].imshow(la, cmap=plt.cm.gray, origin="lower")
+    ax[2, 1].set_axis_off()
+    ax[2, 1].imshow(ca, cmap=plt.cm.gray, origin="lower")
+    ax[2, 2].set_axis_off()
+    ax[2, 2].imshow(ra, cmap=plt.cm.gray, origin="lower")
+
+    if plot_title is None:
+        plot_title = "Registration QC Overlay Slices"
+    fig.suptitle(plot_title, fontsize=16)
+
+    # set figure dpi (and size kinda)
+    fig.set_dpi(300)
+
+    # Save the figure to disk, if requested
+    if fname is not None:
+        fig.savefig(fname, bbox_inches="tight", **fig_kwargs)
+
+    return fig
+
+
 parser = argparse.ArgumentParser(description="load data by subject and create dataframes of stats to merge and plot.")
 parser.add_argument("-d", "--derivatives", action='append', help='Derivatives directory(s) to crawl for IDP features', required=True)
-# parser.add_argument("-p", "--subject", help="subject ID(s) to selectively extract", action='append')
+parser.add_argument("-p", "--subject", help="subject ID(s) to selectively extract", action='append')
 parser.add_argument("-s", "--session", help="participant session to extract")
 parser.add_argument("-r", "--label_ref", help="label volume to reference during alignment estimation")
 parser.add_argument("-v", "--label_vol", help="label volume in reference space to extract ROI data")
@@ -79,7 +228,7 @@ parser.add_argument("-f", "--force", nargs="?", const=1, type=bool, default=Fals
 args = parser.parse_args()
 
 pipelines = args.derivatives
-# sids = args.subject
+sids = args.subject
 sess = args.session
 label_ref = args.label_ref
 label_vol = args.label_vol
@@ -111,6 +260,9 @@ labs, labels, roi_labels = loadLabels(label_vol, tlabels)
 parc = Path(label_vol).name.replace(".nii.gz", "")
 nlabs = len(roi_labels)
 
+# get the labels data - will be transformed to subject space
+tldat = labs.get_fdata()
+
 # load the reference volume for coregistration
 ref = nib.load(label_ref)
 
@@ -139,6 +291,11 @@ for pipe in pipelines:
     # generator of subject folders
     subjs = os.listdir(Path(pipe, pvers, "output"))
     print(f" -- N subjects found: {len(list(subjs))}")
+
+    # if sids given, filter to those
+    if sids is not None:
+        subjs = [s for s in subjs if s in sids]
+        print(f" -- N subjects after filtering: {len(list(subjs))}")
 
     # for every subject
     print(f" -- Extracting IDP data from: {pname}-{pvers}")
@@ -174,23 +331,34 @@ for pipe in pipelines:
             tshell = "missing"
 
         #
-        # linearly align dipy DTI FA (dpdtfa) to input ref
+        # linear + nonlinear align dipy DTI FA (dpdtfa) to input ref
         #
 
         # path to subject affine file
-        subj_aff_stem = f"sub-{sub}_ses-{sess}_{pname}-{pvers}_{label_aff}_sub2mni.txt"
+        subj_aff_stem = f"sub-{sub}_ses-{sess}_{pname}-{pvers}_{label_aff}_sub2mni_affine.txt"
+        subj_wrp_stem = f"sub-{sub}_ses-{sess}_{pname}-{pvers}_{label_aff}_sub2mni_warp.nii.gz"
         subj_aff = Path(saffdir, subj_aff_stem)
+        subj_wrp = Path(saffdir, subj_aff_stem)
+        subj_qcd = Path(saffdir, "qc")
 
         # if the affine file exists, load it
-        if subj_aff.exists():
+        if subj_aff.exists() & subj_wrp.exists():
+
             print(f" --  --  -- Using existing affine: {subj_aff_stem}")
-            sub2mni = np.loadtxt(subj_aff)
-            mni2sub = np.linalg.inv(sub2mni)
+
+            # load the text affine file
+            sub2mni_aff = np.loadtxt(subj_aff)
+            mni2sub_aff = np.linalg.inv(sub2mni_aff)
+
+            # load the subject space image
             mov = nib.load(Path(dpdir, f"sub-{sub}_ses-{sess}_model-dti_param-fa_map.nii.gz"))
+
+            # load the warp field - affine must exist or it should be redone
+            sub2mni_wrp = read_mapping("sub2mni-warp.nii.gz", mov, ref, prealign=mni2sub_aff)
 
         # otherwise compute alignment of FA to template
         else:
-            print(" --  --  -- Affine alignment not found. Computing.")
+            print(" --  --  -- Alignment files not found. Computing.")
 
             try:
                 mov = nib.load(Path(dpdir, f"sub-{sub}_ses-{sess}_model-dti_param-fa_map.nii.gz"))
@@ -198,7 +366,8 @@ for pipe in pipelines:
                 print(" -- -- Failed to load DT FA image for alignment. Nothing can be done.")
                 continue
 
-            _, sub2mni = affine_registration(
+            # perform affine registration
+            _, sub2mni_aff = affine_registration(
                 mov,
                 ref,
                 moving_affine=mov.affine,
@@ -211,25 +380,62 @@ for pipe in pipelines:
                 factors=[4, 2, 1],
             )
 
+            # perform nonlinear registration
+            _, sub2mni_wrp = syn_registration(
+                mov,
+                ref,
+                moving_affine=mov.affine,
+                static_affine=ref.affine,
+                prealign=sub2mni_aff)
+
         # save the affine to disk
         if not subj_aff.exists():
             saffdir.mkdir(parents=True, exist_ok=True)
             print(f" --  --  -- Saving affine to: {subj_aff}")
-            np.savetxt(subj_aff, sub2mni)
+            np.savetxt(subj_aff, sub2mni_aff)
+
+        # save the warp to disk
+        if not subj_wrp.exists():
+            print(f" --  --  -- Saving warp to: {subj_wrp}")
+            write_mapping(sub2mni_wrp, subj_wrp)
 
         # get the invervse affine
-        mni2sub = np.linalg.inv(sub2mni)
+        mni2sub_aff = np.linalg.inv(sub2mni_aff)
 
-        # apply inverse of computed xfrom move ref labs to data space
-        tlabs = conform(
-            labs,
-            out_shape=mov.shape,
-            voxel_size=mov.header.get_zooms(),
-            order=0,  # nearest neighbor
-        )
+        # create the affine map object to apply linear transform
+        affmap = AffineMap(
+            sub2mni_aff,
+            domain_grid_shape=ref.shape,
+            domain_grid2world=ref.affine,
+            codomain_grid_shape=mov.shape,
+            codomain_grid2world=mov.affine)
 
-        # get resampled labels
-        tldat = tlabs.get_fdata()
+        # transform the moving image w/ linear affine only for qc
+        qc1 = affmap.transform(mov.get_fdata())
+
+        # create a QC image of the linear alignment
+        qcOverlaySlices(ref, qc1,
+                        plot_title=f"sub-{sub}_ses-{sess} {pname} Linear Alignment QC",
+                        fname=Path(subj_qcd, f"sub-{sub}_ses-{sess}_{pname}_{ref}_linear_qc.png"))
+
+        # create the inverse warp object to go from MNI to subject space
+        qc2 = sub2mni_wrp.transform_inverse(mov.get_fdata())
+
+        # create a QC image of the nonlinear alignment
+        qcOverlaySlices(ref, qc2,
+                        plot_title=f"sub-{sub}_ses-{sess} {pname} Nonlinear Alignment QC",
+                        fname=Path(subj_qcd, f"sub-{sub}_ses-{sess}_{pname}_{ref}_warp_qc.png"))
+
+        # apply the nonliear warp
+        tlabs = sub2mni_wrp.transform_inverse(tldat,
+                                              interpolation="nearest",
+                                              out_shape=mov.shape,
+                                              out_grid2world=mov.affine)
+
+        # create a QC image of the labels over subject alignment
+        qcOverlaySlices(ref, tlabs, labels=True,
+                        plot_title=f"sub-{sub}_ses-{sess} {pname} Warped Labels QC",
+                        fname=Path(subj_qcd, f"sub-{sub}_ses-{sess}_{pname}_{ref}_labels_qc.png"))
 
         #
         # load and prep data for extraction
